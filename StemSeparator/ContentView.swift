@@ -5,40 +5,40 @@ import AppKit
 // MARK: - Separation Model
 
 enum SeparationModel: String, CaseIterable, Identifiable {
-    case two  = "2 Stems"
-    case four = "4 Stems"
-    case six  = "6 Stems"
+    case fast     = "Fast"
+    case standard = "Standard"
+    case full     = "6 Tracks"
 
     var id: String { rawValue }
 
     var modelName: String {
         switch self {
-        case .two, .four: return "htdemucs"
-        case .six:        return "htdemucs_6s"
+        case .fast:     return "mdx_extra_q"
+        case .standard: return "htdemucs"
+        case .full:     return "htdemucs_6s"
         }
     }
 
     var stems: [String] {
         switch self {
-        case .two:  return ["vocals", "no_vocals"]
-        case .four: return ["vocals", "drums", "bass", "other"]
-        case .six:  return ["vocals", "drums", "bass", "other", "guitar", "piano"]
+        case .fast, .standard: return ["vocals", "drums", "bass", "other"]
+        case .full:            return ["vocals", "drums", "bass", "other", "guitar", "piano"]
         }
     }
 
     var demucsArgs: [String] {
         switch self {
-        case .two:  return ["-n", "htdemucs", "--two-stems", "vocals"]
-        case .four: return ["-n", "htdemucs"]
-        case .six:  return ["-n", "htdemucs_6s"]
+        case .fast:     return ["-n", "mdx_extra_q"]
+        case .standard: return ["-n", "htdemucs"]
+        case .full:     return ["-n", "htdemucs_6s"]
         }
     }
 
     var detail: String {
         switch self {
-        case .two:  return "Vocals · Instrumental"
-        case .four: return "Vocals · Drums · Bass · Other"
-        case .six:  return "Vocals · Guitar · Piano · Drums · Bass · Other"
+        case .fast:     return "mdx_extra_q · Vocals, Drums, Bass, Other"
+        case .standard: return "htdemucs · Vocals, Drums, Bass, Other"
+        case .full:     return "htdemucs_6s · Vocals, Guitar, Piano, Drums, Bass, Other"
         }
     }
 
@@ -95,7 +95,7 @@ struct QueueItem: Identifiable {
 class QueueManager: ObservableObject {
     @Published var items: [QueueItem] = []
     @Published var isDragOver = false
-    @Published var selectedModel: SeparationModel = .two
+    @Published var selectedModel: SeparationModel = .standard
 
     private var isRunning = false
 
@@ -310,6 +310,10 @@ struct StemSaveButtons: View {
 
     private let columns = [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())]
 
+    private var instrumentalStems: [(stem: String, url: URL)] {
+        stems.filter { $0.stem != "vocals" }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             LazyVGrid(columns: columns, spacing: 6) {
@@ -325,14 +329,25 @@ struct StemSaveButtons: View {
                     .controlSize(.small)
                 }
             }
-            Button {
-                queue.saveAll(stems: stems, baseName: baseName)
-            } label: {
-                Label("Save All to Folder…", systemImage: "arrow.down.circle.fill")
-                    .frame(maxWidth: .infinity)
+            HStack(spacing: 6) {
+                Button {
+                    queue.saveAll(stems: instrumentalStems, baseName: baseName)
+                } label: {
+                    Label("Save Instrumentals", systemImage: "music.note")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    queue.saveAll(stems: stems, baseName: baseName)
+                } label: {
+                    Label("Save All", systemImage: "arrow.down.circle.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
         }
         .padding(.leading, 28)
     }
