@@ -2,51 +2,98 @@ import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
 
-class SeparationState: ObservableObject {
-    enum Phase {
-        case idle
-        case processing
+struct QueueItem: Identifiable {
+    let id = UUID()
+    let url: URL
+    var status: Status
+
+    var fileName: String { url.lastPathComponent }
+    var baseName: String {
+        URL(fileURLWithPath: url.lastPathComponent).deletingPathExtension().lastPathComponent
+    }
+
+    enum Status {
+        case waiting
+        case processing(String)
         case done(URL, URL)
         case error(String)
     }
+}
 
-    @Published var phase: Phase = .idle
+class QueueManager: ObservableObject {
+    @Published var items: [QueueItem] = []
     @Published var isDragOver = false
-    @Published var statusText = ""
-    @Published var droppedFileName = ""
 
-    func process(url: URL) {
-        droppedFileName = url.lastPathComponent
-        phase = .processing
-        statusText = "Preparing..."
+    private var isRunning = false
 
-        let outputDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("StemSep_\(UUID().uuidString)")
+    func enqueue(urls: [URL]) {
+        for url in urls {
+            let alreadyActive = items.contains(where: { item in
+                guard item.url == url else { return false }
+                switch item.status {
+                case .waiting, .processing: return true
+                default: return false
+                }
+            })
+            if !alreadyActive {
+                items.append(QueueItem(url: url, status: .waiting))
+            }
+        }
+        processNext()
+    }
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.runDemucs(inputURL: url, outputDir: outputDir)
+    func remove(id: UUID) {
+        items.removeAll { $0.id == id }
+    }
+
+    func clearCompleted() {
+        items.removeAll {
+            switch $0.status {
+            case .done, .error: return true
+            default: return false
+            }
         }
     }
 
-    private func runDemucs(inputURL: URL, outputDir: URL) {
+    private func processNext() {
+        guard !isRunning else { return }
+        guard let idx = items.firstIndex(where: { if case .waiting = $0.status { return true }; return false }) else { return }
+
+        isRunning = true
+        let item = items[idx]
+        setStatus(id: item.id, .processing("Starting…"))
+
+        let outputDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StemSep_\(item.id.uuidString)")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.run(item: item, outputDir: outputDir)
+        }
+    }
+
+    private func run(item: QueueItem, outputDir: URL) {
         do {
             try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
         } catch {
-            setError("Cannot create temp directory:\n\(error.localizedDescription)")
+            finish(id: item.id, error: "Cannot create temp dir")
             return
         }
 
         guard let demucsPath = locateDemucs() else {
-            setError("demucs not found.\n\nInstall it with:\n  pip install demucs\n\nThen make sure it's on your PATH\n(/opt/homebrew/bin or /usr/local/bin)")
+            finish(id: item.id, error: "demucs not found.\n\nInstall with: pip install demucs")
             return
         }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: demucsPath)
-        process.arguments = ["--two-stems", "vocals", "-o", outputDir.path, inputURL.path]
+        process.arguments = ["--two-stems", "vocals", "-o", outputDir.path, item.url.path]
 
         var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Library/Frameworks/Python.framework/Versions/3.13/bin:/Library/Frameworks/Python.framework/Versions/3.12/bin:/Library/Frameworks/Python.framework/Versions/3.11/bin:" + (env["PATH"] ?? "")
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+            + ":/Library/Frameworks/Python.framework/Versions/3.13/bin"
+            + ":/Library/Frameworks/Python.framework/Versions/3.12/bin"
+            + ":/Library/Frameworks/Python.framework/Versions/3.11/bin"
+            + ":" + (env["PATH"] ?? "")
         process.environment = env
 
         let pipe = Pipe()
@@ -56,16 +103,13 @@ class SeparationState: ObservableObject {
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            let lastLine = text
-                .components(separatedBy: "\n")
+            let last = text.components(separatedBy: "\n")
                 .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? ""
-            DispatchQueue.main.async { self?.statusText = lastLine }
+            self?.setStatus(id: item.id, .processing(last))
         }
 
-        do {
-            try process.run()
-        } catch {
-            setError("Failed to launch demucs:\n\(error.localizedDescription)")
+        do { try process.run() } catch {
+            finish(id: item.id, error: "Failed to launch demucs")
             return
         }
 
@@ -73,19 +117,38 @@ class SeparationState: ObservableObject {
         pipe.fileHandleForReading.readabilityHandler = nil
 
         guard process.terminationStatus == 0 else {
-            setError("Demucs exited with error \(process.terminationStatus).\n\nInstall demucs:\n  pip install demucs")
+            finish(id: item.id, error: "Demucs exited with error \(process.terminationStatus)")
             return
         }
 
-        let baseName = inputURL.deletingPathExtension().lastPathComponent
-        guard let (vocals, instrumental) = findStems(in: outputDir, baseName: baseName) else {
-            setError("Demucs finished but output files not found.\n\nCheck temp folder:\n\(outputDir.path)")
+        let baseName = item.url.deletingPathExtension().lastPathComponent
+        guard let (v, i) = findStems(in: outputDir, baseName: baseName) else {
+            finish(id: item.id, error: "Output files not found after separation")
             return
         }
 
         DispatchQueue.main.async { [weak self] in
-            self?.phase = .done(vocals, instrumental)
-            self?.statusText = ""
+            guard let self else { return }
+            self.setStatus(id: item.id, .done(v, i))
+            self.isRunning = false
+            self.processNext()
+        }
+    }
+
+    private func finish(id: UUID, error: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.setStatus(id: id, .error(error))
+            self.isRunning = false
+            self.processNext()
+        }
+    }
+
+    private func setStatus(id: UUID, _ status: QueueItem.Status) {
+        DispatchQueue.main.async { [weak self] in
+            if let idx = self?.items.firstIndex(where: { $0.id == id }) {
+                self?.items[idx].status = status
+            }
         }
     }
 
@@ -105,7 +168,7 @@ class SeparationState: ObservableObject {
         p.executableURL = URL(fileURLWithPath: "/usr/bin/which")
         p.arguments = ["demucs"]
         var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Library/Frameworks/Python.framework/Versions/3.13/bin:/Library/Frameworks/Python.framework/Versions/3.12/bin:/Library/Frameworks/Python.framework/Versions/3.11/bin:" + (env["PATH"] ?? "")
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Library/Frameworks/Python.framework/Versions/3.13/bin:" + (env["PATH"] ?? "")
         p.environment = env
         let pipe = Pipe()
         p.standardOutput = pipe
@@ -136,19 +199,6 @@ class SeparationState: ObservableObject {
         return nil
     }
 
-    private func setError(_ message: String) {
-        DispatchQueue.main.async { [weak self] in
-            self?.phase = .error(message)
-            self?.statusText = ""
-        }
-    }
-
-    func reset() {
-        phase = .idle
-        statusText = ""
-        droppedFileName = ""
-    }
-
     func saveFile(at source: URL, suggestedName: String) {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = suggestedName
@@ -176,21 +226,259 @@ class SeparationState: ObservableObject {
     }
 }
 
+// MARK: - Queue Row
+
+struct QueueItemRow: View {
+    let item: QueueItem
+    @ObservedObject var queue: QueueManager
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                statusIcon
+                Text(item.fileName)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                removeButton
+            }
+
+            statusDetail
+        }
+        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .background(rowBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    @ViewBuilder
+    private var statusIcon: some View {
+        switch item.status {
+        case .waiting:
+            Image(systemName: "clock")
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+        case .processing:
+            ProgressView()
+                .scaleEffect(0.7)
+                .frame(width: 18)
+        case .done:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .frame(width: 18)
+        case .error:
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundStyle(.red)
+                .frame(width: 18)
+        }
+    }
+
+    @ViewBuilder
+    private var statusDetail: some View {
+        switch item.status {
+        case .waiting:
+            Text("Waiting in queue")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.leading, 28)
+
+        case .processing(let text):
+            Text(text.isEmpty ? "Processing…" : text)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .padding(.leading, 28)
+
+        case .done(let vocals, let instrumental):
+            HStack(spacing: 8) {
+                Button {
+                    queue.saveFile(at: vocals, suggestedName: "\(item.baseName)_vocals.wav")
+                } label: {
+                    Label("Vocals", systemImage: "mic.fill")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    queue.saveFile(at: instrumental, suggestedName: "\(item.baseName)_instrumental.wav")
+                } label: {
+                    Label("Instrumental", systemImage: "music.note")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    queue.saveBoth(vocals: vocals, instrumental: instrumental, baseName: item.baseName)
+                } label: {
+                    Label("Both", systemImage: "arrow.down.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+            .padding(.leading, 28)
+
+        case .error(let msg):
+            Text(msg)
+                .font(.caption)
+                .foregroundStyle(.red.opacity(0.8))
+                .lineLimit(2)
+                .padding(.leading, 28)
+        }
+    }
+
+    private var removeButton: some View {
+        Button {
+            queue.remove(id: item.id)
+        } label: {
+            Image(systemName: "xmark")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+        .opacity({
+            if case .processing = item.status { return 0 }
+            return 1
+        }())
+        .disabled({
+            if case .processing = item.status { return true }
+            return false
+        }())
+    }
+
+    private var rowBackground: some View {
+        Group {
+            switch item.status {
+            case .done:
+                Color.green.opacity(0.06)
+            case .error:
+                Color.red.opacity(0.06)
+            case .processing:
+                Color.accentColor.opacity(0.05)
+            case .waiting:
+                Color(NSColor.controlBackgroundColor)
+            }
+        }
+    }
+}
+
+// MARK: - Drop Zone
+
+struct DropZoneView: View {
+    @ObservedObject var queue: QueueManager
+    let compact: Bool
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: compact ? 10 : 16)
+                .fill(queue.isDragOver
+                      ? Color.accentColor.opacity(0.1)
+                      : Color(NSColor.controlBackgroundColor))
+                .overlay(
+                    RoundedRectangle(cornerRadius: compact ? 10 : 16)
+                        .strokeBorder(
+                            queue.isDragOver ? Color.accentColor : Color.secondary.opacity(0.3),
+                            style: StrokeStyle(lineWidth: 2, dash: queue.isDragOver ? [] : [8])
+                        )
+                )
+
+            if compact {
+                HStack(spacing: 10) {
+                    Image(systemName: "plus.circle")
+                        .foregroundStyle(queue.isDragOver ? Color.accentColor : Color.secondary)
+                    Text(queue.isDragOver ? "Release to add" : "Drop more files here")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Choose Files…") { openPanel() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+                .padding(.horizontal, 16)
+            } else {
+                VStack(spacing: 14) {
+                    Image(systemName: "waveform")
+                        .font(.system(size: 48, weight: .thin))
+                        .foregroundStyle(queue.isDragOver ? Color.accentColor : Color.secondary)
+                    VStack(spacing: 4) {
+                        Text("Drop audio files here")
+                            .font(.headline)
+                        Text("MP3 · WAV · FLAC · M4A · AIFF")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    Button("Choose Files…") { openPanel() }
+                        .buttonStyle(.bordered)
+                }
+            }
+        }
+        .onDrop(of: [.fileURL], isTargeted: $queue.isDragOver) { providers in
+            var urls: [URL] = []
+            let group = DispatchGroup()
+            for provider in providers {
+                group.enter()
+                _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                    if let url = url { urls.append(url) }
+                    group.leave()
+                }
+            }
+            group.notify(queue: .main) { queue.enqueue(urls: urls) }
+            return true
+        }
+    }
+
+    private func openPanel() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.audio]
+        panel.begin { response in
+            if response == .OK { queue.enqueue(urls: panel.urls) }
+        }
+    }
+}
+
+// MARK: - Main View
+
 struct ContentView: View {
-    @StateObject private var state = SeparationState()
+    @StateObject private var queue = QueueManager()
+
+    var doneCount: Int {
+        queue.items.filter { if case .done = $0.status { return true }; return false }.count
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            headerView
+            header
             Divider()
-            mainContent
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if queue.items.isEmpty {
+                DropZoneView(queue: queue, compact: false)
+                    .padding(28)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                DropZoneView(queue: queue, compact: true)
+                    .frame(height: 48)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 10)
+
+                Divider()
+                    .padding(.top, 10)
+
+                ScrollView {
+                    LazyVStack(spacing: 6) {
+                        ForEach(queue.items) { item in
+                            QueueItemRow(item: item, queue: queue)
+                        }
+                    }
+                    .padding(14)
+                }
+            }
         }
-        .frame(width: 520, height: 420)
+        .frame(width: 560)
         .background(Color(NSColor.windowBackgroundColor))
     }
 
-    private var headerView: some View {
+    private var header: some View {
         HStack(spacing: 10) {
             Image(systemName: "music.note.list")
                 .font(.title2)
@@ -198,171 +486,16 @@ struct ContentView: View {
             Text("Stem Separator")
                 .font(.title2.weight(.semibold))
             Spacer()
-        }
-        .padding(.horizontal, 28)
-        .padding(.vertical, 16)
-    }
-
-    @ViewBuilder
-    private var mainContent: some View {
-        if case .idle = state.phase {
-            idleView
-        } else if case .processing = state.phase {
-            processingView
-        } else if case .done(let vocals, let instrumental) = state.phase {
-            doneView(vocals: vocals, instrumental: instrumental)
-        } else if case .error(let message) = state.phase {
-            errorView(message: message)
-        }
-    }
-
-    private var idleView: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 16)
-                .fill(state.isDragOver
-                      ? Color.accentColor.opacity(0.1)
-                      : Color(NSColor.controlBackgroundColor))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16)
-                        .strokeBorder(
-                            state.isDragOver ? Color.accentColor : Color.secondary.opacity(0.3),
-                            style: StrokeStyle(lineWidth: 2, dash: state.isDragOver ? [] : [8])
-                        )
-                )
-
-            VStack(spacing: 14) {
-                Image(systemName: "waveform")
-                    .font(.system(size: 48, weight: .thin))
-                    .foregroundStyle(state.isDragOver ? Color.accentColor : Color.secondary)
-
-                VStack(spacing: 4) {
-                    Text("Drop an audio file here")
-                        .font(.headline)
-                    Text("MP3 · WAV · FLAC · M4A · AIFF")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+            if doneCount > 0 {
+                Button("Clear Done (\(doneCount))") {
+                    queue.clearCompleted()
                 }
-
-                Button("Choose File…") { openPanel() }
-                    .buttonStyle(.bordered)
-            }
-        }
-        .padding(28)
-        .contentShape(Rectangle())
-        .onDrop(of: [.fileURL], isTargeted: $state.isDragOver) { providers in
-            guard let provider = providers.first else { return false }
-            _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                guard let url = url else { return }
-                DispatchQueue.main.async { self.state.process(url: url) }
-            }
-            return true
-        }
-    }
-
-    private var processingView: some View {
-        VStack(spacing: 20) {
-            if !state.droppedFileName.isEmpty {
-                Label(state.droppedFileName, systemImage: "music.note")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-            ProgressView()
-                .scaleEffect(1.4)
-            VStack(spacing: 6) {
-                Text("Separating tracks…")
-                    .font(.headline)
-                if !state.statusText.isEmpty {
-                    Text(state.statusText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 360)
-                        .lineLimit(2)
-                }
-            }
-        }
-        .padding(28)
-    }
-
-    private func doneView(vocals: URL, instrumental: URL) -> some View {
-        let raw = URL(fileURLWithPath: state.droppedFileName).deletingPathExtension().lastPathComponent
-        let baseName = raw.isEmpty ? "track" : raw
-
-        return VStack(spacing: 24) {
-            VStack(spacing: 8) {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 48))
-                    .foregroundStyle(.green)
-                Text("Separation Complete")
-                    .font(.title3.weight(.semibold))
-                if !state.droppedFileName.isEmpty {
-                    Text(state.droppedFileName)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            HStack(spacing: 12) {
-                Button {
-                    state.saveFile(at: vocals, suggestedName: "\(baseName)_vocals.wav")
-                } label: {
-                    Label("Save Vocals", systemImage: "mic.fill")
-                        .frame(minWidth: 120)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.large)
-
-                Button {
-                    state.saveFile(at: instrumental, suggestedName: "\(baseName)_instrumental.wav")
-                } label: {
-                    Label("Save Instrumental", systemImage: "music.note")
-                        .frame(minWidth: 140)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.large)
-
-                Button {
-                    state.saveBoth(vocals: vocals, instrumental: instrumental, baseName: baseName)
-                } label: {
-                    Label("Save Both", systemImage: "arrow.down.circle.fill")
-                        .frame(minWidth: 100)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-            }
-
-            Button("Process Another File") { state.reset() }
                 .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-        }
-        .padding(28)
-    }
-
-    private func errorView(message: String) -> some View {
-        VStack(spacing: 16) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 44))
-                .foregroundStyle(.orange)
-            Text(message)
                 .font(.callout)
-                .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
-                .frame(maxWidth: 380)
-            Button("Start Over") { state.reset() }
-                .buttonStyle(.borderedProminent)
-        }
-        .padding(28)
-    }
-
-    private func openPanel() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.allowedContentTypes = [.audio]
-        panel.begin { response in
-            if response == .OK, let url = panel.url {
-                self.state.process(url: url)
             }
         }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
     }
 }
