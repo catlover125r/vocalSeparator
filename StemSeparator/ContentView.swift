@@ -2,9 +2,79 @@ import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
 
+// MARK: - Separation Model
+
+enum SeparationModel: String, CaseIterable, Identifiable {
+    case two  = "2 Stems"
+    case four = "4 Stems"
+    case six  = "6 Stems"
+
+    var id: String { rawValue }
+
+    var modelName: String {
+        switch self {
+        case .two, .four: return "htdemucs"
+        case .six:        return "htdemucs_6s"
+        }
+    }
+
+    var stems: [String] {
+        switch self {
+        case .two:  return ["vocals", "no_vocals"]
+        case .four: return ["vocals", "drums", "bass", "other"]
+        case .six:  return ["vocals", "drums", "bass", "other", "guitar", "piano"]
+        }
+    }
+
+    var demucsArgs: [String] {
+        switch self {
+        case .two:  return ["-n", "htdemucs", "--two-stems", "vocals"]
+        case .four: return ["-n", "htdemucs"]
+        case .six:  return ["-n", "htdemucs_6s"]
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .two:  return "Vocals · Instrumental"
+        case .four: return "Vocals · Drums · Bass · Other"
+        case .six:  return "Vocals · Guitar · Piano · Drums · Bass · Other"
+        }
+    }
+
+    static func label(_ stem: String) -> String {
+        switch stem {
+        case "vocals":    return "Vocals"
+        case "no_vocals": return "Instrumental"
+        case "drums":     return "Drums"
+        case "bass":      return "Bass"
+        case "other":     return "Other"
+        case "guitar":    return "Guitar"
+        case "piano":     return "Piano"
+        default:          return stem.capitalized
+        }
+    }
+
+    static func icon(_ stem: String) -> String {
+        switch stem {
+        case "vocals":    return "mic.fill"
+        case "no_vocals": return "music.note"
+        case "drums":     return "waveform"
+        case "bass":      return "waveform.path.ecg"
+        case "other":     return "ellipsis.circle"
+        case "guitar":    return "music.quarternote.3"
+        case "piano":     return "music.note.list"
+        default:          return "waveform"
+        }
+    }
+}
+
+// MARK: - Queue Item
+
 struct QueueItem: Identifiable {
     let id = UUID()
     let url: URL
+    let model: SeparationModel
     var status: Status
 
     var fileName: String { url.lastPathComponent }
@@ -15,18 +85,22 @@ struct QueueItem: Identifiable {
     enum Status {
         case waiting
         case processing(String)
-        case done(URL, URL)
+        case done([(stem: String, url: URL)])
         case error(String)
     }
 }
 
+// MARK: - Queue Manager
+
 class QueueManager: ObservableObject {
     @Published var items: [QueueItem] = []
     @Published var isDragOver = false
+    @Published var selectedModel: SeparationModel = .two
 
     private var isRunning = false
 
     func enqueue(urls: [URL]) {
+        let model = selectedModel
         for url in urls {
             let alreadyActive = items.contains(where: { item in
                 guard item.url == url else { return false }
@@ -36,7 +110,7 @@ class QueueManager: ObservableObject {
                 }
             })
             if !alreadyActive {
-                items.append(QueueItem(url: url, status: .waiting))
+                items.append(QueueItem(url: url, model: model, status: .waiting))
             }
         }
         processNext()
@@ -58,14 +132,10 @@ class QueueManager: ObservableObject {
     private func processNext() {
         guard !isRunning else { return }
         guard let idx = items.firstIndex(where: { if case .waiting = $0.status { return true }; return false }) else { return }
-
         isRunning = true
         let item = items[idx]
         setStatus(id: item.id, .processing("Starting…"))
-
-        let outputDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("StemSep_\(item.id.uuidString)")
-
+        let outputDir = FileManager.default.temporaryDirectory.appendingPathComponent("StemSep_\(item.id.uuidString)")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.run(item: item, outputDir: outputDir)
         }
@@ -86,7 +156,7 @@ class QueueManager: ObservableObject {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: demucsPath)
-        process.arguments = ["--two-stems", "vocals", "-o", outputDir.path, item.url.path]
+        process.arguments = item.model.demucsArgs + ["-o", outputDir.path, item.url.path]
 
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
@@ -122,23 +192,24 @@ class QueueManager: ObservableObject {
         }
 
         let baseName = item.url.deletingPathExtension().lastPathComponent
-        guard let (v, i) = findStems(in: outputDir, baseName: baseName) else {
+        let stems = findStems(in: outputDir, baseName: baseName, expected: item.model.stems)
+        guard !stems.isEmpty else {
             finish(id: item.id, error: "Output files not found after separation")
             return
         }
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.setStatus(id: item.id, .done(v, i))
+            self.setStatus(id: item.id, .done(stems))
             self.isRunning = false
             self.processNext()
         }
     }
 
-    private func finish(id: UUID, error: String) {
+    private func finish(id: UUID, error msg: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.setStatus(id: id, .error(error))
+            self.setStatus(id: id, .error(msg))
             self.isRunning = false
             self.processNext()
         }
@@ -161,42 +232,43 @@ class QueueManager: ObservableObject {
             "/Library/Frameworks/Python.framework/Versions/3.12/bin/demucs",
             "/Library/Frameworks/Python.framework/Versions/3.11/bin/demucs",
         ]
-        for path in candidates {
-            if FileManager.default.fileExists(atPath: path) { return path }
-        }
+        for path in candidates { if FileManager.default.fileExists(atPath: path) { return path } }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/which")
         p.arguments = ["demucs"]
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Library/Frameworks/Python.framework/Versions/3.13/bin:" + (env["PATH"] ?? "")
         p.environment = env
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = Pipe()
-        try? p.run()
-        p.waitUntilExit()
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = Pipe()
+        try? p.run(); p.waitUntilExit()
         let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return out.isEmpty ? nil : out
     }
 
-    private func findStems(in outputDir: URL, baseName: String) -> (URL, URL)? {
+    private func findStems(in outputDir: URL, baseName: String, expected: [String]) -> [(stem: String, url: URL)] {
         let fm = FileManager.default
-        guard let modelDirs = try? fm.contentsOfDirectory(at: outputDir, includingPropertiesForKeys: nil) else { return nil }
+
+        func check(dir: URL) -> [(stem: String, url: URL)] {
+            let found = expected.compactMap { stem -> (stem: String, url: URL)? in
+                let f = dir.appendingPathComponent("\(stem).wav")
+                return fm.fileExists(atPath: f.path) ? (stem, f) : nil
+            }
+            return found.count == expected.count ? found : []
+        }
+
+        guard let modelDirs = try? fm.contentsOfDirectory(at: outputDir, includingPropertiesForKeys: nil) else { return [] }
         for modelDir in modelDirs {
-            let songDir = modelDir.appendingPathComponent(baseName)
-            let v = songDir.appendingPathComponent("vocals.wav")
-            let nv = songDir.appendingPathComponent("no_vocals.wav")
-            if fm.fileExists(atPath: v.path) && fm.fileExists(atPath: nv.path) { return (v, nv) }
+            let exact = check(dir: modelDir.appendingPathComponent(baseName))
+            if !exact.isEmpty { return exact }
             if let subdirs = try? fm.contentsOfDirectory(at: modelDir, includingPropertiesForKeys: nil) {
                 for sd in subdirs {
-                    let v2 = sd.appendingPathComponent("vocals.wav")
-                    let nv2 = sd.appendingPathComponent("no_vocals.wav")
-                    if fm.fileExists(atPath: v2.path) && fm.fileExists(atPath: nv2.path) { return (v2, nv2) }
+                    let found = check(dir: sd)
+                    if !found.isEmpty { return found }
                 }
             }
         }
-        return nil
+        return []
     }
 
     func saveFile(at source: URL, suggestedName: String) {
@@ -210,19 +282,59 @@ class QueueManager: ObservableObject {
         }
     }
 
-    func saveBoth(vocals: URL, instrumental: URL, baseName: String) {
+    func saveAll(stems: [(stem: String, url: URL)], baseName: String) {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.prompt = "Save Here"
-        panel.message = "Choose a folder to save both stems"
+        panel.message = "Choose a folder — all stems will be saved there"
         panel.begin { response in
             guard response == .OK, let dest = panel.url else { return }
-            let base = baseName.isEmpty ? "track" : baseName
-            try? FileManager.default.copyItem(at: vocals, to: dest.appendingPathComponent("\(base)_vocals.wav"))
-            try? FileManager.default.copyItem(at: instrumental, to: dest.appendingPathComponent("\(base)_instrumental.wav"))
+            for (stem, url) in stems {
+                try? FileManager.default.copyItem(
+                    at: url,
+                    to: dest.appendingPathComponent("\(baseName)_\(stem).wav")
+                )
+            }
         }
+    }
+}
+
+// MARK: - Stem Save Buttons
+
+struct StemSaveButtons: View {
+    let stems: [(stem: String, url: URL)]
+    let baseName: String
+    let queue: QueueManager
+
+    private let columns = [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            LazyVGrid(columns: columns, spacing: 6) {
+                ForEach(stems, id: \.stem) { stem, url in
+                    Button {
+                        queue.saveFile(at: url, suggestedName: "\(baseName)_\(stem).wav")
+                    } label: {
+                        Label(SeparationModel.label(stem), systemImage: SeparationModel.icon(stem))
+                            .frame(maxWidth: .infinity)
+                            .lineLimit(1)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            Button {
+                queue.saveAll(stems: stems, baseName: baseName)
+            } label: {
+                Label("Save All to Folder…", systemImage: "arrow.down.circle.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+        }
+        .padding(.leading, 28)
     }
 }
 
@@ -230,16 +342,21 @@ class QueueManager: ObservableObject {
 
 struct QueueItemRow: View {
     let item: QueueItem
-    @ObservedObject var queue: QueueManager
+    let queue: QueueManager
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
                 statusIcon
-                Text(item.fileName)
-                    .font(.callout.weight(.medium))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(item.fileName)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(item.model.rawValue)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 removeButton
             }
@@ -290,73 +407,36 @@ struct QueueItemRow: View {
                 .lineLimit(2)
                 .padding(.leading, 28)
 
-        case .done(let vocals, let instrumental):
-            HStack(spacing: 8) {
-                Button {
-                    queue.saveFile(at: vocals, suggestedName: "\(item.baseName)_vocals.wav")
-                } label: {
-                    Label("Vocals", systemImage: "mic.fill")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                Button {
-                    queue.saveFile(at: instrumental, suggestedName: "\(item.baseName)_instrumental.wav")
-                } label: {
-                    Label("Instrumental", systemImage: "music.note")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                Button {
-                    queue.saveBoth(vocals: vocals, instrumental: instrumental, baseName: item.baseName)
-                } label: {
-                    Label("Both", systemImage: "arrow.down.circle.fill")
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-            }
-            .padding(.leading, 28)
+        case .done(let stems):
+            StemSaveButtons(stems: stems, baseName: item.baseName, queue: queue)
 
         case .error(let msg):
             Text(msg)
                 .font(.caption)
-                .foregroundStyle(.red.opacity(0.8))
-                .lineLimit(2)
+                .foregroundStyle(.red.opacity(0.9))
+                .lineLimit(3)
                 .padding(.leading, 28)
         }
     }
 
     private var removeButton: some View {
-        Button {
-            queue.remove(id: item.id)
-        } label: {
+        Button { queue.remove(id: item.id) } label: {
             Image(systemName: "xmark")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
         }
         .buttonStyle(.plain)
-        .opacity({
-            if case .processing = item.status { return 0 }
-            return 1
-        }())
-        .disabled({
-            if case .processing = item.status { return true }
-            return false
-        }())
+        .disabled({ if case .processing = item.status { return true }; return false }())
+        .opacity({ if case .processing = item.status { return 0 }; return 1 }())
     }
 
     private var rowBackground: some View {
         Group {
             switch item.status {
-            case .done:
-                Color.green.opacity(0.06)
-            case .error:
-                Color.red.opacity(0.06)
-            case .processing:
-                Color.accentColor.opacity(0.05)
-            case .waiting:
-                Color(NSColor.controlBackgroundColor)
+            case .done:       Color.green.opacity(0.06)
+            case .error:      Color.red.opacity(0.06)
+            case .processing: Color.accentColor.opacity(0.05)
+            case .waiting:    Color(NSColor.controlBackgroundColor)
             }
         }
     }
@@ -406,6 +486,10 @@ struct DropZoneView: View {
                         Text("MP3 · WAV · FLAC · M4A · AIFF")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
+                        Text(queue.selectedModel.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 2)
                     }
                     Button("Choose Files…") { openPanel() }
                         .buttonStyle(.bordered)
@@ -443,7 +527,7 @@ struct DropZoneView: View {
 struct ContentView: View {
     @StateObject private var queue = QueueManager()
 
-    var doneCount: Int {
+    private var doneCount: Int {
         queue.items.filter { if case .done = $0.status { return true }; return false }.count
     }
 
@@ -451,6 +535,9 @@ struct ContentView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            modelPicker
+            Divider()
+
             if queue.items.isEmpty {
                 DropZoneView(queue: queue, compact: false)
                     .padding(28)
@@ -460,10 +547,7 @@ struct ContentView: View {
                     .frame(height: 48)
                     .padding(.horizontal, 14)
                     .padding(.top, 10)
-
-                Divider()
-                    .padding(.top, 10)
-
+                Divider().padding(.top, 10)
                 ScrollView {
                     LazyVStack(spacing: 6) {
                         ForEach(queue.items) { item in
@@ -474,7 +558,7 @@ struct ContentView: View {
                 }
             }
         }
-        .frame(width: 560)
+        .frame(width: 580)
         .background(Color(NSColor.windowBackgroundColor))
     }
 
@@ -487,15 +571,38 @@ struct ContentView: View {
                 .font(.title2.weight(.semibold))
             Spacer()
             if doneCount > 0 {
-                Button("Clear Done (\(doneCount))") {
-                    queue.clearCompleted()
-                }
-                .buttonStyle(.plain)
-                .font(.callout)
-                .foregroundStyle(.secondary)
+                Button("Clear Done (\(doneCount))") { queue.clearCompleted() }
+                    .buttonStyle(.plain)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+    }
+
+    private var modelPicker: some View {
+        HStack(spacing: 12) {
+            Text("Model")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            Picker("", selection: $queue.selectedModel) {
+                ForEach(SeparationModel.allCases) { model in
+                    Text(model.rawValue).tag(model)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 280)
+
+            Text(queue.selectedModel.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer()
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
     }
 }
