@@ -65,7 +65,7 @@ struct QueueItem: Identifiable {
 
     enum Status {
         case waiting
-        case processing(String)
+        case processing(Double)          // overall 0.0–1.0
         case done([(stem: String, url: URL)], TimeInterval)
         case error(String)
     }
@@ -121,7 +121,7 @@ class QueueManager: ObservableObject {
         isRunning = true
         items[idx].startedAt = Date()
         let item = items[idx]
-        setStatus(id: item.id, .processing("Starting…"))
+        setStatus(id: item.id, .processing(0.0))
         let outputDir = FileManager.default.temporaryDirectory.appendingPathComponent("StemSep_\(item.id.uuidString)")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.run(item: item, outputDir: outputDir)
@@ -157,12 +157,23 @@ class QueueManager: ObservableObject {
         process.standardOutput = pipe
         process.standardError = pipe
 
+        let totalStems = item.config.stems.count
+        var fullOutput = ""
+
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            let last = text.components(separatedBy: "\n")
-                .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? ""
-            self?.setStatus(id: item.id, .processing(last))
+            fullOutput += text
+
+            // Count how many stems have fully completed (each shows "100%|")
+            let completedStems = min(
+                fullOutput.components(separatedBy: "100%|").count - 1,
+                totalStems - 1
+            )
+            // Parse the latest percentage in this chunk
+            let currentPct = Self.parseLatestPercent(from: text)
+            let overall = (Double(completedStems) + currentPct / 100.0) / Double(totalStems)
+            self?.setStatus(id: item.id, .processing(min(overall, 0.99)))
         }
 
         do { try process.run() } catch {
@@ -209,6 +220,18 @@ class QueueManager: ObservableObject {
                 self?.items[idx].status = status
             }
         }
+    }
+
+    private static func parseLatestPercent(from text: String) -> Double {
+        // tqdm lines look like "  45%|████      | ..."
+        var last = 0.0
+        var search = text.startIndex..<text.endIndex
+        while let range = text.range(of: #"(\d+)%\|"#, options: .regularExpression, range: search) {
+            let digits = text[range].dropLast(2)
+            if let v = Double(digits) { last = v }
+            search = range.upperBound..<text.endIndex
+        }
+        return last
     }
 
     private func locateDemucs() -> String? {
@@ -401,9 +424,15 @@ struct QueueItemRow: View {
         switch item.status {
         case .waiting:
             Text("Waiting in queue").font(.caption).foregroundStyle(.secondary).padding(.leading, 28)
-        case .processing(let text):
-            Text(text.isEmpty ? "Processing…" : text)
-                .font(.caption).foregroundStyle(.secondary).lineLimit(2).padding(.leading, 28)
+        case .processing(let progress):
+            VStack(alignment: .leading, spacing: 4) {
+                ProgressView(value: progress)
+                Text("\(Int(progress * 100))%")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.leading, 28)
+            .padding(.trailing, 14)
         case .done(let stems, let duration):
             StemSaveButtons(stems: stems, baseName: item.baseName, duration: duration, queue: queue)
         case .error(let msg):
