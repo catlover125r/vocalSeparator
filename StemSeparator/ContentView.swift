@@ -11,17 +11,14 @@ struct ModelConfig {
     let demucsArgs: [String]
     let passes: Int  // number of 0-100% cycles demucs actually runs
 
-    static func make(fast: Bool, fourTracks: Bool) -> ModelConfig {
-        let speedLabel = fast ? "Fast" : "Standard"
+    static func make(fourTracks: Bool) -> ModelConfig {
         let stems: [String] = fourTracks
             ? ["vocals", "drums", "bass", "other"]
             : ["vocals", "no_vocals"]
-        // Both use htdemucs (1 pass). Fast adds -d mps to use Apple Silicon GPU.
-        var args = ["-n", "htdemucs"]
-        if fast { args += ["-d", "mps"] }
+        var args = ["-n", "htdemucs", "-d", "mps"]
         if !fourTracks { args += ["--two-stems", "vocals"] }
         return ModelConfig(
-            label: "\(speedLabel) · \(fourTracks ? "4 Tracks" : "2 Tracks")",
+            label: fourTracks ? "4 Tracks" : "2 Tracks",
             modelName: "htdemucs",
             stems: stems,
             demucsArgs: args,
@@ -79,13 +76,12 @@ struct QueueItem: Identifiable {
 class QueueManager: ObservableObject {
     @Published var items: [QueueItem] = []
     @Published var isDragOver = false
-    @Published var speedFast: Bool = true
     @Published var fourTracks: Bool = false
 
     private var isRunning = false
 
     var currentConfig: ModelConfig {
-        ModelConfig.make(fast: speedFast, fourTracks: fourTracks)
+        ModelConfig.make(fourTracks: fourTracks)
     }
 
     func enqueue(urls: [URL]) {
@@ -593,29 +589,19 @@ struct ContentView: View {
     private var modelPicker: some View {
         HStack(spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Speed").font(.caption).foregroundStyle(.secondary)
-                Picker("", selection: $queue.speedFast) {
-                    Text("Fast").tag(true)
-                    Text("Standard").tag(false)
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 160)
-            }
-
-            VStack(alignment: .leading, spacing: 4) {
                 Text("Tracks").font(.caption).foregroundStyle(.secondary)
                 Picker("", selection: $queue.fourTracks) {
                     Text("2 Tracks").tag(false)
                     Text("4 Tracks").tag(true)
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 160)
+                .frame(width: 180)
             }
 
             Spacer()
 
             VStack(alignment: .trailing, spacing: 2) {
-                Text(queue.speedFast ? "htdemucs · Apple GPU" : "htdemucs · CPU")
+                Text("htdemucs · Apple GPU")
                     .font(.caption.monospaced()).foregroundStyle(.secondary)
                 Text(queue.fourTracks ? "Vocals · Drums · Bass · Other" : "Vocals · Instrumental")
                     .font(.caption).foregroundStyle(.secondary)
