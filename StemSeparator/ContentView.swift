@@ -56,6 +56,7 @@ struct QueueItem: Identifiable {
     let url: URL
     let config: ModelConfig
     var status: Status
+    var startedAt: Date?
 
     var fileName: String { url.lastPathComponent }
     var baseName: String {
@@ -65,7 +66,7 @@ struct QueueItem: Identifiable {
     enum Status {
         case waiting
         case processing(String)
-        case done([(stem: String, url: URL)])
+        case done([(stem: String, url: URL)], TimeInterval)
         case error(String)
     }
 }
@@ -118,6 +119,7 @@ class QueueManager: ObservableObject {
         guard !isRunning else { return }
         guard let idx = items.firstIndex(where: { if case .waiting = $0.status { return true }; return false }) else { return }
         isRunning = true
+        items[idx].startedAt = Date()
         let item = items[idx]
         setStatus(id: item.id, .processing("Starting…"))
         let outputDir = FileManager.default.temporaryDirectory.appendingPathComponent("StemSep_\(item.id.uuidString)")
@@ -185,7 +187,8 @@ class QueueManager: ObservableObject {
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.setStatus(id: item.id, .done(stems))
+            let duration = self.items.first(where: { $0.id == item.id })?.startedAt.map { Date().timeIntervalSince($0) } ?? 0
+            self.setStatus(id: item.id, .done(stems, duration))
             self.isRunning = false
             self.processNext()
         }
@@ -291,6 +294,7 @@ class QueueManager: ObservableObject {
 struct StemSaveButtons: View {
     let stems: [(stem: String, url: URL)]
     let baseName: String
+    let duration: TimeInterval
     let queue: QueueManager
 
     private var instrumentalStems: [(stem: String, url: URL)] {
@@ -299,8 +303,17 @@ struct StemSaveButtons: View {
 
     private let columns = [GridItem(.flexible()), GridItem(.flexible())]
 
+    private var durationString: String {
+        let t = Int(duration)
+        return t >= 60 ? "\(t / 60)m \(t % 60)s" : "\(t)s"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            Text("Completed in \(durationString)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.leading, 28)
             LazyVGrid(columns: columns, spacing: 6) {
                 ForEach(stems, id: \.stem) { stem, url in
                     Button {
@@ -391,8 +404,8 @@ struct QueueItemRow: View {
         case .processing(let text):
             Text(text.isEmpty ? "Processing…" : text)
                 .font(.caption).foregroundStyle(.secondary).lineLimit(2).padding(.leading, 28)
-        case .done(let stems):
-            StemSaveButtons(stems: stems, baseName: item.baseName, queue: queue)
+        case .done(let stems, let duration):
+            StemSaveButtons(stems: stems, baseName: item.baseName, duration: duration, queue: queue)
         case .error(let msg):
             Text(msg).font(.caption).foregroundStyle(.red.opacity(0.9)).lineLimit(3).padding(.leading, 28)
         }
