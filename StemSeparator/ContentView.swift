@@ -2,44 +2,28 @@ import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
 
-// MARK: - Separation Model
+// MARK: - Model Config
 
-enum SeparationModel: String, CaseIterable, Identifiable {
-    case fast     = "Fast"
-    case standard = "Standard"
-    case full     = "6 Tracks"
+struct ModelConfig {
+    let label: String
+    let modelName: String
+    let stems: [String]
+    let demucsArgs: [String]
 
-    var id: String { rawValue }
-
-    var modelName: String {
-        switch self {
-        case .fast:     return "mdx_extra_q"
-        case .standard: return "htdemucs"
-        case .full:     return "htdemucs_6s"
-        }
-    }
-
-    var stems: [String] {
-        switch self {
-        case .fast, .standard: return ["vocals", "drums", "bass", "other"]
-        case .full:            return ["vocals", "drums", "bass", "other", "guitar", "piano"]
-        }
-    }
-
-    var demucsArgs: [String] {
-        switch self {
-        case .fast:     return ["-n", "mdx_extra_q"]
-        case .standard: return ["-n", "htdemucs"]
-        case .full:     return ["-n", "htdemucs_6s"]
-        }
-    }
-
-    var detail: String {
-        switch self {
-        case .fast:     return "mdx_extra_q · Vocals, Drums, Bass, Other"
-        case .standard: return "htdemucs · Vocals, Drums, Bass, Other"
-        case .full:     return "htdemucs_6s · Vocals, Guitar, Piano, Drums, Bass, Other"
-        }
+    static func make(fast: Bool, fourTracks: Bool) -> ModelConfig {
+        let modelName = fast ? "mdx_extra_q" : "htdemucs"
+        let speedLabel = fast ? "Fast" : "Standard"
+        let stems: [String] = fourTracks
+            ? ["vocals", "drums", "bass", "other"]
+            : ["vocals", "no_vocals"]
+        var args = ["-n", modelName]
+        if !fourTracks { args += ["--two-stems", "vocals"] }
+        return ModelConfig(
+            label: "\(speedLabel) · \(fourTracks ? "4 Tracks" : "2 Tracks")",
+            modelName: modelName,
+            stems: stems,
+            demucsArgs: args
+        )
     }
 
     static func label(_ stem: String) -> String {
@@ -49,8 +33,6 @@ enum SeparationModel: String, CaseIterable, Identifiable {
         case "drums":     return "Drums"
         case "bass":      return "Bass"
         case "other":     return "Other"
-        case "guitar":    return "Guitar"
-        case "piano":     return "Piano"
         default:          return stem.capitalized
         }
     }
@@ -62,8 +44,6 @@ enum SeparationModel: String, CaseIterable, Identifiable {
         case "drums":     return "waveform"
         case "bass":      return "waveform.path.ecg"
         case "other":     return "ellipsis.circle"
-        case "guitar":    return "music.quarternote.3"
-        case "piano":     return "music.note.list"
         default:          return "waveform"
         }
     }
@@ -74,7 +54,7 @@ enum SeparationModel: String, CaseIterable, Identifiable {
 struct QueueItem: Identifiable {
     let id = UUID()
     let url: URL
-    let model: SeparationModel
+    let config: ModelConfig
     var status: Status
 
     var fileName: String { url.lastPathComponent }
@@ -95,12 +75,17 @@ struct QueueItem: Identifiable {
 class QueueManager: ObservableObject {
     @Published var items: [QueueItem] = []
     @Published var isDragOver = false
-    @Published var selectedModel: SeparationModel = .standard
+    @Published var speedFast: Bool = true
+    @Published var fourTracks: Bool = false
 
     private var isRunning = false
 
+    var currentConfig: ModelConfig {
+        ModelConfig.make(fast: speedFast, fourTracks: fourTracks)
+    }
+
     func enqueue(urls: [URL]) {
-        let model = selectedModel
+        let config = currentConfig
         for url in urls {
             let alreadyActive = items.contains(where: { item in
                 guard item.url == url else { return false }
@@ -110,7 +95,7 @@ class QueueManager: ObservableObject {
                 }
             })
             if !alreadyActive {
-                items.append(QueueItem(url: url, model: model, status: .waiting))
+                items.append(QueueItem(url: url, config: config, status: .waiting))
             }
         }
         processNext()
@@ -156,7 +141,7 @@ class QueueManager: ObservableObject {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: demucsPath)
-        process.arguments = item.model.demucsArgs + ["-o", outputDir.path, item.url.path]
+        process.arguments = item.config.demucsArgs + ["-o", outputDir.path, item.url.path]
 
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
@@ -192,7 +177,7 @@ class QueueManager: ObservableObject {
         }
 
         let baseName = item.url.deletingPathExtension().lastPathComponent
-        let stems = findStems(in: outputDir, baseName: baseName, expected: item.model.stems)
+        let stems = findStems(in: outputDir, baseName: baseName, expected: item.config.stems)
         guard !stems.isEmpty else {
             finish(id: item.id, error: "Output files not found after separation")
             return
@@ -308,11 +293,11 @@ struct StemSaveButtons: View {
     let baseName: String
     let queue: QueueManager
 
-    private let columns = [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())]
-
     private var instrumentalStems: [(stem: String, url: URL)] {
         stems.filter { $0.stem != "vocals" }
     }
+
+    private let columns = [GridItem(.flexible()), GridItem(.flexible())]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -321,7 +306,7 @@ struct StemSaveButtons: View {
                     Button {
                         queue.saveFile(at: url, suggestedName: "\(baseName)_\(stem).wav")
                     } label: {
-                        Label(SeparationModel.label(stem), systemImage: SeparationModel.icon(stem))
+                        Label(ModelConfig.label(stem), systemImage: ModelConfig.icon(stem))
                             .frame(maxWidth: .infinity)
                             .lineLimit(1)
                     }
@@ -330,15 +315,16 @@ struct StemSaveButtons: View {
                 }
             }
             HStack(spacing: 6) {
-                Button {
-                    queue.saveAll(stems: instrumentalStems, baseName: baseName)
-                } label: {
-                    Label("Save Instrumentals", systemImage: "music.note")
-                        .frame(maxWidth: .infinity)
+                if instrumentalStems.count > 1 {
+                    Button {
+                        queue.saveAll(stems: instrumentalStems, baseName: baseName)
+                    } label: {
+                        Label("Save Instrumentals", systemImage: "music.note")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
                 Button {
                     queue.saveAll(stems: stems, baseName: baseName)
                 } label: {
@@ -368,14 +354,13 @@ struct QueueItemRow: View {
                         .font(.callout.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text(item.model.rawValue)
+                    Text(item.config.label)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
                 removeButton
             }
-
             statusDetail
         }
         .padding(.vertical, 10)
@@ -388,21 +373,13 @@ struct QueueItemRow: View {
     private var statusIcon: some View {
         switch item.status {
         case .waiting:
-            Image(systemName: "clock")
-                .foregroundStyle(.secondary)
-                .frame(width: 18)
+            Image(systemName: "clock").foregroundStyle(.secondary).frame(width: 18)
         case .processing:
-            ProgressView()
-                .scaleEffect(0.7)
-                .frame(width: 18)
+            ProgressView().scaleEffect(0.7).frame(width: 18)
         case .done:
-            Image(systemName: "checkmark.circle.fill")
-                .foregroundStyle(.green)
-                .frame(width: 18)
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).frame(width: 18)
         case .error:
-            Image(systemName: "exclamationmark.circle.fill")
-                .foregroundStyle(.red)
-                .frame(width: 18)
+            Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.red).frame(width: 18)
         }
     }
 
@@ -410,35 +387,20 @@ struct QueueItemRow: View {
     private var statusDetail: some View {
         switch item.status {
         case .waiting:
-            Text("Waiting in queue")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.leading, 28)
-
+            Text("Waiting in queue").font(.caption).foregroundStyle(.secondary).padding(.leading, 28)
         case .processing(let text):
             Text(text.isEmpty ? "Processing…" : text)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-                .padding(.leading, 28)
-
+                .font(.caption).foregroundStyle(.secondary).lineLimit(2).padding(.leading, 28)
         case .done(let stems):
             StemSaveButtons(stems: stems, baseName: item.baseName, queue: queue)
-
         case .error(let msg):
-            Text(msg)
-                .font(.caption)
-                .foregroundStyle(.red.opacity(0.9))
-                .lineLimit(3)
-                .padding(.leading, 28)
+            Text(msg).font(.caption).foregroundStyle(.red.opacity(0.9)).lineLimit(3).padding(.leading, 28)
         }
     }
 
     private var removeButton: some View {
         Button { queue.remove(id: item.id) } label: {
-            Image(systemName: "xmark")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+            Image(systemName: "xmark").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
         }
         .buttonStyle(.plain)
         .disabled({ if case .processing = item.status { return true }; return false }())
@@ -476,18 +438,15 @@ struct DropZoneView: View {
                             style: StrokeStyle(lineWidth: 2, dash: queue.isDragOver ? [] : [8])
                         )
                 )
-
             if compact {
                 HStack(spacing: 10) {
                     Image(systemName: "plus.circle")
                         .foregroundStyle(queue.isDragOver ? Color.accentColor : Color.secondary)
                     Text(queue.isDragOver ? "Release to add" : "Drop more files here")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .font(.callout).foregroundStyle(.secondary)
                     Spacer()
                     Button("Choose Files…") { openPanel() }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
+                        .buttonStyle(.bordered).controlSize(.small)
                 }
                 .padding(.horizontal, 16)
             } else {
@@ -496,18 +455,13 @@ struct DropZoneView: View {
                         .font(.system(size: 48, weight: .thin))
                         .foregroundStyle(queue.isDragOver ? Color.accentColor : Color.secondary)
                     VStack(spacing: 4) {
-                        Text("Drop audio files here")
-                            .font(.headline)
+                        Text("Drop audio files here").font(.headline)
                         Text("MP3 · WAV · FLAC · M4A · AIFF")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                        Text(queue.selectedModel.detail)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .padding(.top, 2)
+                            .font(.subheadline).foregroundStyle(.secondary)
+                        Text(queue.currentConfig.label)
+                            .font(.caption).foregroundStyle(.secondary).padding(.top, 2)
                     }
-                    Button("Choose Files…") { openPanel() }
-                        .buttonStyle(.bordered)
+                    Button("Choose Files…") { openPanel() }.buttonStyle(.bordered)
                 }
             }
         }
@@ -552,7 +506,6 @@ struct ContentView: View {
             Divider()
             modelPicker
             Divider()
-
             if queue.items.isEmpty {
                 DropZoneView(queue: queue, compact: false)
                     .padding(28)
@@ -573,23 +526,20 @@ struct ContentView: View {
                 }
             }
         }
-        .frame(width: 580)
+        .frame(width: 560)
         .background(Color(NSColor.windowBackgroundColor))
     }
 
     private var header: some View {
         HStack(spacing: 10) {
             Image(systemName: "music.note.list")
-                .font(.title2)
-                .foregroundStyle(Color.accentColor)
+                .font(.title2).foregroundStyle(Color.accentColor)
             Text("Stem Separator")
                 .font(.title2.weight(.semibold))
             Spacer()
             if doneCount > 0 {
                 Button("Clear Done (\(doneCount))") { queue.clearCompleted() }
-                    .buttonStyle(.plain)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .buttonStyle(.plain).font(.callout).foregroundStyle(.secondary)
             }
         }
         .padding(.horizontal, 20)
@@ -597,24 +547,35 @@ struct ContentView: View {
     }
 
     private var modelPicker: some View {
-        HStack(spacing: 12) {
-            Text("Model")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-
-            Picker("", selection: $queue.selectedModel) {
-                ForEach(SeparationModel.allCases) { model in
-                    Text(model.rawValue).tag(model)
+        HStack(spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Speed").font(.caption).foregroundStyle(.secondary)
+                Picker("", selection: $queue.speedFast) {
+                    Text("Fast").tag(true)
+                    Text("Standard").tag(false)
                 }
+                .pickerStyle(.segmented)
+                .frame(width: 160)
             }
-            .pickerStyle(.segmented)
-            .frame(maxWidth: 280)
 
-            Text(queue.selectedModel.detail)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Tracks").font(.caption).foregroundStyle(.secondary)
+                Picker("", selection: $queue.fourTracks) {
+                    Text("2 Tracks").tag(false)
+                    Text("4 Tracks").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 160)
+            }
+
             Spacer()
+
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(queue.speedFast ? "mdx_extra_q" : "htdemucs")
+                    .font(.caption.monospaced()).foregroundStyle(.secondary)
+                Text(queue.fourTracks ? "Vocals · Drums · Bass · Other" : "Vocals · Instrumental")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 10)
