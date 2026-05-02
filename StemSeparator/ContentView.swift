@@ -308,6 +308,42 @@ class QueueManager: ObservableObject {
             }
         }
     }
+
+    func downloadAll() {
+        let doneItems = items.compactMap { item -> (baseName: String, stems: [(stem: String, url: URL)])? in
+            if case .done(let stems, _) = item.status { return (item.baseName, stems) }
+            return nil
+        }
+        guard !doneItems.isEmpty else { return }
+
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "StemSeparator.zip"
+        panel.allowedContentTypes = [UTType.zip]
+        panel.canCreateDirectories = true
+        panel.begin { response in
+            guard response == .OK, let dest = panel.url else { return }
+            let fm = FileManager.default
+            let tempDir = fm.temporaryDirectory.appendingPathComponent("StemSepZip_\(UUID().uuidString)")
+            do {
+                try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+                for item in doneItems {
+                    let folderURL = tempDir.appendingPathComponent(item.baseName)
+                    try fm.createDirectory(at: folderURL, withIntermediateDirectories: true)
+                    for (stem, url) in item.stems {
+                        try? fm.copyItem(at: url, to: folderURL.appendingPathComponent("\(item.baseName)_\(stem).wav"))
+                    }
+                }
+                try? fm.removeItem(at: dest)
+                let zip = Process()
+                zip.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+                zip.arguments = ["-r", dest.path, "."]
+                zip.currentDirectoryURL = tempDir
+                try zip.run()
+                zip.waitUntilExit()
+            } catch {}
+            try? fm.removeItem(at: tempDir)
+        }
+    }
 }
 
 // MARK: - Stem Save Buttons
@@ -578,6 +614,11 @@ struct ContentView: View {
                 .font(.title2.weight(.semibold))
             Spacer()
             if doneCount > 0 {
+                Button { queue.downloadAll() } label: {
+                    Label("Download All", systemImage: "arrow.down.circle")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
                 Button("Clear Done (\(doneCount))") { queue.clearCompleted() }
                     .buttonStyle(.plain).font(.callout).foregroundStyle(.secondary)
             }
