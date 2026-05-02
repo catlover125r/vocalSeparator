@@ -12,21 +12,20 @@ struct ModelConfig {
     let passes: Int  // number of 0-100% cycles demucs actually runs
 
     static func make(fast: Bool, fourTracks: Bool) -> ModelConfig {
-        let modelName = fast ? "mdx_extra_q" : "htdemucs"
         let speedLabel = fast ? "Fast" : "Standard"
         let stems: [String] = fourTracks
             ? ["vocals", "drums", "bass", "other"]
             : ["vocals", "no_vocals"]
-        var args = ["-n", modelName]
+        // Both use htdemucs (1 pass). Fast adds -d mps to use Apple Silicon GPU.
+        var args = ["-n", "htdemucs"]
+        if fast { args += ["-d", "mps"] }
         if !fourTracks { args += ["--two-stems", "vocals"] }
-        // htdemucs = 1 sub-model (1 pass), mdx_extra_q = 4 sub-models (4 passes)
-        let passes = fast ? 4 : 1
         return ModelConfig(
             label: "\(speedLabel) · \(fourTracks ? "4 Tracks" : "2 Tracks")",
-            modelName: modelName,
+            modelName: "htdemucs",
             stems: stems,
             demucsArgs: args,
-            passes: passes
+            passes: 1
         )
     }
 
@@ -616,7 +615,7 @@ struct ContentView: View {
             Spacer()
 
             VStack(alignment: .trailing, spacing: 2) {
-                Text(queue.speedFast ? "mdx_extra_q" : "htdemucs")
+                Text(queue.speedFast ? "htdemucs · Apple GPU" : "htdemucs · CPU")
                     .font(.caption.monospaced()).foregroundStyle(.secondary)
                 Text(queue.fourTracks ? "Vocals · Drums · Bass · Other" : "Vocals · Instrumental")
                     .font(.caption).foregroundStyle(.secondary)
