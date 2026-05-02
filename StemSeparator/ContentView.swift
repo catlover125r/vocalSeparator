@@ -9,6 +9,7 @@ struct ModelConfig {
     let modelName: String
     let stems: [String]
     let demucsArgs: [String]
+    let passes: Int  // number of 0-100% cycles demucs actually runs
 
     static func make(fast: Bool, fourTracks: Bool) -> ModelConfig {
         let modelName = fast ? "mdx_extra_q" : "htdemucs"
@@ -18,11 +19,14 @@ struct ModelConfig {
             : ["vocals", "no_vocals"]
         var args = ["-n", modelName]
         if !fourTracks { args += ["--two-stems", "vocals"] }
+        // htdemucs = 1 sub-model (1 pass), mdx_extra_q = 4 sub-models (4 passes)
+        let passes = fast ? 4 : 1
         return ModelConfig(
             label: "\(speedLabel) · \(fourTracks ? "4 Tracks" : "2 Tracks")",
             modelName: modelName,
             stems: stems,
-            demucsArgs: args
+            demucsArgs: args,
+            passes: passes
         )
     }
 
@@ -157,7 +161,7 @@ class QueueManager: ObservableObject {
         process.standardOutput = pipe
         process.standardError = pipe
 
-        let totalStems = item.config.stems.count
+        let totalPasses = item.config.passes
         var fullOutput = ""
 
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -165,14 +169,13 @@ class QueueManager: ObservableObject {
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             fullOutput += text
 
-            // Count how many stems have fully completed (each shows "100%|")
-            let completedStems = min(
+            // Each completed pass shows "100%|" in the output
+            let completedPasses = min(
                 fullOutput.components(separatedBy: "100%|").count - 1,
-                totalStems - 1
+                totalPasses - 1
             )
-            // Parse the latest percentage in this chunk
             let currentPct = Self.parseLatestPercent(from: text)
-            let overall = (Double(completedStems) + currentPct / 100.0) / Double(totalStems)
+            let overall = (Double(completedPasses) + currentPct / 100.0) / Double(totalPasses)
             self?.setStatus(id: item.id, .processing(min(overall, 0.99)))
         }
 
